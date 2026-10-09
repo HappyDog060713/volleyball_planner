@@ -1,0 +1,8 @@
+/volleyball_planner_node:
+  ros__parameters:
+    max_chassis_speed: 2.0
+    chassis_kp: 2.2
+    strike_delay_time: 0.41
+    strike_tolerance_s: 0.05
+    base_frame: "base_link"
+    stewart_frame: "lower_platform_center"
