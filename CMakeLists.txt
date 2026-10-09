@@ -15,6 +15,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(chassis_controllers REQUIRED)
 find_package(volleyball_controller REQUIRED)
+find_package(volleyball_tracker REQUIRED)
 
 include_directories(
   include
@@ -34,6 +35,7 @@ ament_target_dependencies(${PROJECT_NAME}_core
   tf2_geometry_msgs
   chassis_controllers
   volleyball_controller
+  volleyball_tracker
 )
 
 target_link_libraries(${PROJECT_NAME}_core
@@ -57,6 +59,7 @@ ament_target_dependencies(volleyball_planner_node
   tf2_geometry_msgs
   chassis_controllers
   volleyball_controller
+  volleyball_tracker
 )
 
 install(TARGETS

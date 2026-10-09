@@ -4,6 +4,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include "volleyball_tracker/msg/trajectory_prediction.hpp"
 #include "volleyball_planner/interception_planner.hpp"
 
 class VolleyballPlannerNode : public rclcpp::Node {
@@ -30,14 +31,10 @@ public:
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-        // Subscriptions
-        ball_sub_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-            "/volleyball/position_filtered", rclcpp::SensorDataQoS(),
-            std::bind(&VolleyballPlannerNode::ballCallback, this, std::placeholders::_1));
-
-        landing_sub_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-            "/volleyball/landing_prediction", 10,
-            std::bind(&VolleyballPlannerNode::landingCallback, this, std::placeholders::_1));
+        // Subscribe to complete dynamic trajectory prediction
+        traj_sub_ = this->create_subscription<volleyball_tracker::msg::TrajectoryPrediction>(
+            "/volleyball/trajectory_pred", 10,
+            std::bind(&VolleyballPlannerNode::trajectoryCallback, this, std::placeholders::_1));
 
         // Publishers directly targeting volleyball_controller & chassis_controllers
         chassis_pub_ = this->create_publisher<chassis_controllers::msg::ChassisControl>(
@@ -53,62 +50,75 @@ public:
             std::chrono::milliseconds(20), // 50 Hz control loop
             std::bind(&VolleyballPlannerNode::controlLoop, this));
 
-        RCLCPP_INFO(this->get_logger(), "VolleyballPlannerNode initialized.");
+        RCLCPP_INFO(this->get_logger(), "VolleyballPlannerNode initialized. Subscribing to /volleyball/trajectory_pred.");
     }
 
 private:
-    void ballCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
-        last_ball_msg_ = *msg;
-        has_ball_ = true;
-        last_ball_time_ = this->now();
-    }
-
-    void landingCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
-        last_landing_msg_ = *msg;
-        has_landing_ = true;
+    void trajectoryCallback(const volleyball_tracker::msg::TrajectoryPrediction::SharedPtr msg) {
+        last_traj_msg_ = *msg;
+        has_traj_ = true;
+        last_update_time_ = this->now();
     }
 
     void controlLoop() {
-        if (!has_ball_ || (this->now() - last_ball_time_).seconds() > 0.4) {
-            // Stop robot if ball is lost
+        if (!has_traj_ || !last_traj_msg_.is_tracking || (this->now() - last_update_time_).seconds() > 0.4) {
+            // Stop robot and reset Stewart platform if ball is lost or not tracked
             stopChassis();
+            resetStewart();
             return;
         }
 
-        // Transform landing point to robot base frame
+        double time_to_arrive = last_traj_msg_.time_to_landing;
+        if (time_to_arrive <= 0.0) {
+            // Ball already landed or invalid
+            stopChassis();
+            resetStewart();
+            return;
+        }
+
+        // 1. Compute target relative to base_link
+        geometry_msgs::msg::PointStamped landing_pt;
+        landing_pt.header = last_traj_msg_.header;
+        landing_pt.point = last_traj_msg_.landing_position;
+
         geometry_msgs::msg::PointStamped target_in_base;
-        if (has_landing_) {
+        if (landing_pt.header.frame_id != base_frame_) {
             try {
-                if (tf_buffer_->canTransform(base_frame_, last_landing_msg_.header.frame_id, tf2::TimePointZero)) {
-                    target_in_base = tf_buffer_->transform(last_landing_msg_, base_frame_);
+                if (tf_buffer_->canTransform(base_frame_, landing_pt.header.frame_id, tf2::TimePointZero)) {
+                    target_in_base = tf_buffer_->transform(landing_pt, base_frame_);
                 } else {
-                    target_in_base = last_landing_msg_;
+                    target_in_base = landing_pt;
                 }
-            } catch (const tf2::TransformException& ex) {
-                target_in_base = last_landing_msg_;
+            } catch (const tf2::TransformException&) {
+                target_in_base = landing_pt;
             }
         } else {
-            target_in_base = last_ball_msg_;
+            target_in_base = landing_pt;
         }
 
         Eigen::Vector2d rel_target(target_in_base.point.x, target_in_base.point.y);
-        double est_time_to_arrive = 1.0; // Estimated from ball trajectory
 
-        // 1. Compute and publish chassis command
-        auto chassis_cmd = planner_.planChassisMovement(rel_target, est_time_to_arrive);
+        // 2. Plan and publish dynamic chassis movement
+        auto chassis_cmd = planner_.planChassisMovement(rel_target, time_to_arrive);
         chassis_pub_->publish(chassis_cmd);
 
-        // 2. Compute and publish Stewart orientation
-        Eigen::Vector3d incoming_vel(0.0, -5.0, -3.0); // Derived from EKF state
+        // 3. Plan and publish dynamic Stewart orientation from real incoming velocity
+        Eigen::Vector3d incoming_vel(
+            last_traj_msg_.current_velocity.x,
+            last_traj_msg_.current_velocity.y,
+            last_traj_msg_.current_velocity.z
+        );
         auto stewart_cmd = planner_.planStewartPose(incoming_vel);
         stewart_pub_->publish(stewart_cmd);
 
-        // 3. Evaluate strike timing
-        if (planner_.evaluateStrikeTrigger(est_time_to_arrive, rel_target.norm())) {
+        // 4. Evaluate strike timing using dynamic remaining time
+        if (planner_.evaluateStrikeTrigger(time_to_arrive, rel_target.norm())) {
             std_msgs::msg::Bool trigger_msg;
             trigger_msg.data = true;
             strike_pub_->publish(trigger_msg);
-            RCLCPP_INFO(this->get_logger(), "Strike trigger sent!");
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+                                 "Strike trigger sent! Remaining time: %.3fs, Dist: %.2fm",
+                                 time_to_arrive, rel_target.norm());
         }
     }
 
@@ -117,7 +127,21 @@ private:
         stop_cmd.x_speed = 0.0f;
         stop_cmd.y_speed = 0.0f;
         stop_cmd.spin_speed = 0.0f;
+        stop_cmd.emergency_stop = 0;
+        stop_cmd.power_limit = 0;
         chassis_pub_->publish(stop_cmd);
+    }
+
+    void resetStewart() {
+        volleyball_controller::msg::StewartControl neutral_cmd;
+        neutral_cmd.x = 0.0f;
+        neutral_cmd.y = 0.0f;
+        neutral_cmd.z = 0.22816f; // Nominal height
+        neutral_cmd.roll = 0.0f;
+        neutral_cmd.pitch = 0.0f;
+        neutral_cmd.yaw = 0.0f;
+        neutral_cmd.emergency_stop = 0;
+        stewart_pub_->publish(neutral_cmd);
     }
 
     std::string base_frame_;
@@ -127,19 +151,16 @@ private:
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr ball_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr landing_sub_;
+    rclcpp::Subscription<volleyball_tracker::msg::TrajectoryPrediction>::SharedPtr traj_sub_;
 
     rclcpp::Publisher<chassis_controllers::msg::ChassisControl>::SharedPtr chassis_pub_;
     rclcpp::Publisher<volleyball_controller::msg::StewartControl>::SharedPtr stewart_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr strike_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
-    geometry_msgs::msg::PointStamped last_ball_msg_;
-    geometry_msgs::msg::PointStamped last_landing_msg_;
-    bool has_ball_{false};
-    bool has_landing_{false};
-    rclcpp::Time last_ball_time_{0, 0, RCL_ROS_TIME};
+    volleyball_tracker::msg::TrajectoryPrediction last_traj_msg_;
+    bool has_traj_{false};
+    rclcpp::Time last_update_time_{0, 0, RCL_ROS_TIME};
 };
 
 int main(int argc, char** argv) {
