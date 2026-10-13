@@ -2,7 +2,10 @@
   ros__parameters:
     max_chassis_speed: 2.0
     chassis_kp: 2.2
-    strike_delay_time: 0.41
-    strike_tolerance_s: 0.05
+    stewart_ready_z: 0.20
+    stewart_strike_z: 0.36
+    strike_delay_time: 0.15
+    strike_duration_s: 0.20
+    strike_distance_thresh: 0.25
     base_frame: "base_link"
     stewart_frame: "lower_platform_center"

@@ -54,12 +54,14 @@ chassis_controllers::msg::ChassisControl InterceptionPlanner::planChassisMovemen
 }
 
 volleyball_controller::msg::StewartControl InterceptionPlanner::planStewartPose(
-    const Eigen::Vector3d& incoming_vel_in_base)
+    const Eigen::Vector3d& incoming_vel_in_base,
+    bool is_striking_now)
 {
     volleyball_controller::msg::StewartControl cmd;
     cmd.x = 0.0f;
     cmd.y = 0.0f;
-    cmd.z = static_cast<float>(config_.default_height);
+    // 反击时 Stewart 平台快速上升顶击至 stewart_strike_z (0.36m)；平时处于蓄力高度 stewart_ready_z (0.20m)
+    cmd.z = static_cast<float>(is_striking_now ? config_.stewart_strike_z : config_.stewart_ready_z);
     cmd.yaw = 0.0f;
     cmd.emergency_stop = 0;
 
@@ -87,15 +89,14 @@ bool InterceptionPlanner::evaluateStrikeTrigger(
     double time_to_intercept,
     double distance_to_target)
 {
-    // Strike is triggered when:
-    // 1. Robot is close enough to target (< 20cm)
-    // 2. Remaining flight time matches mechanical swing delay
-    if (distance_to_target > 0.25) {
+    // Stewart 平台反击顶升触发条件:
+    // 1. 底盘已移动至拦截落点容差范围内 (< strike_distance_thresh, 0.25m)
+    // 2. 来球剩余飞行时间进入 Stewart 平台机械顶升达峰窗口 (0 < time_to_intercept <= strike_delay_time)
+    if (distance_to_target > config_.strike_distance_thresh) {
         return false;
     }
 
-    double diff = std::abs(time_to_intercept - config_.strike_delay_time);
-    return (diff <= config_.strike_tolerance_s);
+    return (time_to_intercept > 0.0 && time_to_intercept <= config_.strike_delay_time);
 }
 
 } // namespace volleyball_planner

@@ -12,8 +12,11 @@ public:
     VolleyballPlannerNode() : Node("volleyball_planner_node") {
         this->declare_parameter<double>("max_chassis_speed", 2.0);
         this->declare_parameter<double>("chassis_kp", 2.2);
-        this->declare_parameter<double>("strike_delay_time", 0.41);
-        this->declare_parameter<double>("strike_tolerance_s", 0.05);
+        this->declare_parameter<double>("stewart_ready_z", 0.20);
+        this->declare_parameter<double>("stewart_strike_z", 0.36);
+        this->declare_parameter<double>("strike_delay_time", 0.15);
+        this->declare_parameter<double>("strike_duration_s", 0.20);
+        this->declare_parameter<double>("strike_distance_thresh", 0.25);
         this->declare_parameter<std::string>("base_frame", "base_link");
         this->declare_parameter<std::string>("stewart_frame", "lower_platform_center");
 
@@ -23,8 +26,11 @@ public:
         volleyball_planner::PlannerConfig cfg;
         cfg.max_chassis_speed = this->get_parameter("max_chassis_speed").as_double();
         cfg.chassis_kp = this->get_parameter("chassis_kp").as_double();
+        cfg.stewart_ready_z = this->get_parameter("stewart_ready_z").as_double();
+        cfg.stewart_strike_z = this->get_parameter("stewart_strike_z").as_double();
         cfg.strike_delay_time = this->get_parameter("strike_delay_time").as_double();
-        cfg.strike_tolerance_s = this->get_parameter("strike_tolerance_s").as_double();
+        cfg.strike_duration_s = this->get_parameter("strike_duration_s").as_double();
+        cfg.strike_distance_thresh = this->get_parameter("strike_distance_thresh").as_double();
         planner_.setConfig(cfg);
 
         // TF2 setup
@@ -63,14 +69,25 @@ private:
     void controlLoop() {
         if (!has_traj_ || !last_traj_msg_.is_tracking || (this->now() - last_update_time_).seconds() > 0.4) {
             // Stop robot and reset Stewart platform if ball is lost or not tracked
+            is_striking_ = false;
             stopChassis();
             resetStewart();
             return;
         }
 
+        // 检查正在执行的 Stewart 顶升击球是否超时回落
+        if (is_striking_) {
+            if ((this->now() - strike_start_time_).seconds() > planner_.getConfig().strike_duration_s) {
+                is_striking_ = false;
+                RCLCPP_INFO(this->get_logger(),
+                            "Stewart upward counter-strike finished, returning to ready height %.2fm.",
+                            planner_.getConfig().stewart_ready_z);
+            }
+        }
+
         double time_to_arrive = last_traj_msg_.time_to_landing;
-        if (time_to_arrive <= 0.0) {
-            // Ball already landed or invalid
+        if (time_to_arrive <= 0.0 && !is_striking_) {
+            // Ball already landed or invalid, and not currently executing strike
             stopChassis();
             resetStewart();
             return;
@@ -98,28 +115,35 @@ private:
 
         Eigen::Vector2d rel_target(target_in_base.point.x, target_in_base.point.y);
 
-        // 2. Plan and publish dynamic chassis movement
-        auto chassis_cmd = planner_.planChassisMovement(rel_target, time_to_arrive);
-        chassis_pub_->publish(chassis_cmd);
+        // 2. 评估 Stewart 平台上升反击触发时机
+        if (!is_striking_ && planner_.evaluateStrikeTrigger(time_to_arrive, rel_target.norm())) {
+            is_striking_ = true;
+            strike_start_time_ = this->now();
 
-        // 3. Plan and publish dynamic Stewart orientation from real incoming velocity
+            std_msgs::msg::Bool trigger_msg;
+            trigger_msg.data = true;
+            strike_pub_->publish(trigger_msg);
+            RCLCPP_INFO(this->get_logger(),
+                        "Stewart upward counter-strike TRIGGERED! Remaining time: %.3fs, Dist: %.2fm, Target Z: %.2fm",
+                        time_to_arrive, rel_target.norm(), planner_.getConfig().stewart_strike_z);
+        }
+
+        // 3. 底盘控制：击打爆发期间底盘急刹锁死以提供最大刚性支撑；拦截机动期间全速向落点对位
+        if (is_striking_) {
+            stopChassis();
+        } else {
+            auto chassis_cmd = planner_.planChassisMovement(rel_target, time_to_arrive);
+            chassis_pub_->publish(chassis_cmd);
+        }
+
+        // 4. Stewart 姿态与高度规划：反击期间冲顶至 stewart_strike_z，平时维持 stewart_ready_z
         Eigen::Vector3d incoming_vel(
             last_traj_msg_.current_velocity.x,
             last_traj_msg_.current_velocity.y,
             last_traj_msg_.current_velocity.z
         );
-        auto stewart_cmd = planner_.planStewartPose(incoming_vel);
+        auto stewart_cmd = planner_.planStewartPose(incoming_vel, is_striking_);
         stewart_pub_->publish(stewart_cmd);
-
-        // 4. Evaluate strike timing using dynamic remaining time
-        if (planner_.evaluateStrikeTrigger(time_to_arrive, rel_target.norm())) {
-            std_msgs::msg::Bool trigger_msg;
-            trigger_msg.data = true;
-            strike_pub_->publish(trigger_msg);
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-                                 "Strike trigger sent! Remaining time: %.3fs, Dist: %.2fm",
-                                 time_to_arrive, rel_target.norm());
-        }
     }
 
     void stopChassis() {
@@ -136,7 +160,7 @@ private:
         volleyball_controller::msg::StewartControl neutral_cmd;
         neutral_cmd.x = 0.0f;
         neutral_cmd.y = 0.0f;
-        neutral_cmd.z = 0.22816f; // Nominal height
+        neutral_cmd.z = static_cast<float>(planner_.getConfig().default_height); // Nominal height (0.22816m)
         neutral_cmd.roll = 0.0f;
         neutral_cmd.pitch = 0.0f;
         neutral_cmd.yaw = 0.0f;
@@ -161,6 +185,9 @@ private:
     volleyball_tracker::msg::TrajectoryPrediction last_traj_msg_;
     bool has_traj_{false};
     rclcpp::Time last_update_time_{0, 0, RCL_ROS_TIME};
+
+    bool is_striking_{false};
+    rclcpp::Time strike_start_time_{0, 0, RCL_ROS_TIME};
 };
 
 int main(int argc, char** argv) {
